@@ -4,4 +4,4 @@
 
 # Results
 * Masked files are put into masked_data folder.
-* data.txt is the combination of a masked files.  
+* data.txt is the combination of all masked files.  
