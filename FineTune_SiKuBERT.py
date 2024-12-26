@@ -7,12 +7,17 @@ import matplotlib.pyplot as plt
 import math
 import pandas as pd
 from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, KFold
+import ast
 
-# Định nghĩa lớp MaskedDataset
+
+
+
+
+
 class MaskedDataset(Dataset):
     def __init__(self, dataframe, tokenizer, max_length=512):
-        self.data = dataframe
+        self.data = dataframe.reset_index(drop=True)
         self.tokenizer = tokenizer
         self.max_length = max_length
 
@@ -21,7 +26,7 @@ class MaskedDataset(Dataset):
 
     def __getitem__(self, idx):
         text = self.data.iloc[idx]['Text']
-        label = self.data.iloc[idx]['Label']
+        labels = self.data.iloc[idx]['Label']  # Danh sách các labels tương ứng với [MASK] tokens
 
         # Tokenize văn bản
         encoding = self.tokenizer(
@@ -36,31 +41,32 @@ class MaskedDataset(Dataset):
         input_ids = encoding['input_ids'].squeeze()  # [max_length]
         attention_mask = encoding['attention_mask'].squeeze()  # [max_length]
 
-        # Tìm vị trí của [MASK]
-        mask_token_index = torch.where(input_ids == self.tokenizer.mask_token_id)[0]
+        # Tìm vị trí của tất cả các [MASK]
+        mask_token_indices = torch.where(input_ids == self.tokenizer.mask_token_id)[0]
 
-        if len(mask_token_index) != 1:
-            raise ValueError(f"Câu số {idx} không có đúng một [MASK] token.")
+        if len(mask_token_indices) == 0:
+            raise ValueError(f"Câu số {idx} không có [MASK] token.")
 
-        mask_index = mask_token_index.item()
-
-        # Chuyển đổi label thành token ID
-        label_id = self.tokenizer.convert_tokens_to_ids(label)
-
-        # Tạo labels: -100 cho tất cả các vị trí ngoại trừ [MASK]
-        labels = torch.full(input_ids.shape, -100)
-        labels[mask_index] = label_id
+        # Xử lý labels: -100 cho tất cả các vị trí ngoại trừ [MASK]
+        labels_tensor = torch.full(input_ids.shape, -100)
+        for i, mask_index in enumerate(mask_token_indices):
+            if i < len(labels):
+                label_token_id = self.tokenizer.convert_tokens_to_ids(labels[i])
+                labels_tensor[mask_index] = label_token_id
+            else:
+                # Nếu số lượng labels ít hơn số [MASK], có thể bỏ qua hoặc xử lý theo cách khác
+                pass
 
         return {
             'input_ids': input_ids,
             'attention_mask': attention_mask,
-            'labels': labels
+            'labels': labels_tensor
         }
 
-# Hàm tính accuracy
+
 def compute_accuracy(predictions, labels):
     """
-    Tính accuracy cho các dự đoán tại vị trí [MASK]
+    Tính accuracy cho các dự đoán tại các vị trí [MASK]
     """
     preds = torch.argmax(predictions, dim=-1)
     mask = labels != -100  # Chỉ xét các vị trí có label
@@ -68,16 +74,21 @@ def compute_accuracy(predictions, labels):
     accuracy = correct.sum().float() / mask.sum().float()
     return accuracy
 
-# Hàm tính top-k accuracy
+
+
+
 def compute_top_k_accuracy(logits, labels, k=5):
     """
-    Tính top-k accuracy cho các dự đoán tại vị trí [MASK].
+    Tính top-k accuracy cho các dự đoán tại các vị trí [MASK].
     """
-    top_k = torch.topk(logits, k, dim=-1).indices
-    correct = top_k == labels.unsqueeze(-1)
-    correct = correct.any(dim=-1)
+    top_k = torch.topk(logits, k, dim=-1).indices  # [batch_size, seq_length, k]
+    correct = top_k == labels.unsqueeze(-1)  # [batch_size, seq_length, k]
+    correct = correct.any(dim=-1)  # [batch_size, seq_length]
     accuracy = correct.sum().float() / (labels != -100).sum().float()
     return accuracy
+
+
+
 
 # Cài đặt và khởi tạo
 def main():
@@ -99,28 +110,17 @@ def main():
 
     print(f"Đã thêm {num_added_tokens} tokens vào tokenizer.")
 
-    sample_sentences = [
-        "𠄎𠂤𡿨𡯨",
-        "民浪屡奴群低",
-        "戈䀡󰘚倍踈兮㐌仃"
-    ]
-
-    for sentence in sample_sentences:
-        tokens = tokenizer.tokenize(sentence)
-        token_ids = tokenizer.convert_tokens_to_ids(tokens)
-        print(f"Câu: {sentence}")
-        print(f"Tokens: {tokens}")
-        print(f"Token IDs: {token_ids}")
-        print("-" * 50)
-
     # Đọc dataset
-    data_path = 'masked_dataset.csv'
+    data_path = 'data.csv'
     df = pd.read_csv(data_path)
     df.dropna(inplace=True)
     print(f"Loaded dataset with {len(df)} samples.")
 
+    # Chuyển đổi cột 'Label' từ chuỗi thành danh sách
+    df['Label'] = df['Label'].apply(lambda x: ast.literal_eval(x) if isinstance(x, str) else x)
+
     # Kiểm tra và thêm OOV tokens vào tokenizer
-    oov_tokens = [token for token in df['Label'].unique() if token not in tokenizer.get_vocab()]
+    oov_tokens = [token for token in df['Label'].explode().unique() if token not in tokenizer.get_vocab()]
     print(f"Số lượng OOV tokens: {len(oov_tokens)}")
 
     if oov_tokens:
@@ -130,99 +130,175 @@ def main():
     else:
         print("Tất cả các token đã được bao phủ trong tokenizer.")
 
-    # Chia dữ liệu thành tập huấn luyện và validation
-    train_df, val_df = train_test_split(df, test_size=0.1, random_state=42)
-    print(f"Training samples: {len(train_df)}, Validation samples: {len(val_df)}")
+    # Khởi tạo K-Fold
+    k_folds = 5
+    kfold = KFold(n_splits=k_folds, shuffle=True, random_state=42)
 
-    # Tạo các Dataset cho tập huấn luyện và validation
-    train_dataset = MaskedDataset(train_df, tokenizer, max_length=512)
-    val_dataset = MaskedDataset(val_df, tokenizer, max_length=512)
+    # Chuyển đổi dataframe thành numpy array để sử dụng KFold
+    data = df.reset_index(drop=True)
+    X = data['Text'].values
+    y = data['Label'].values  # Không sử dụng trong KFold vì nhiệm vụ là MLM
 
-    # Tạo các DataLoader cho tập huấn luyện và validation
-    train_dataloader = DataLoader(train_dataset, batch_size=16, shuffle=True)
-    val_dataloader = DataLoader(val_dataset, batch_size=16, shuffle=False)
-    print(f"Created DataLoader with batch size 16.")
+    # Khởi tạo SummaryWriter cho K-Fold
+    writer = SummaryWriter(log_dir='runs/fine_tune_sikubert_kfold')
 
-    # Đặt thiết bị
-    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
-    model.to(device)
-    print(f"Đang sử dụng thiết bị: {device}")
+    # Danh sách lưu trữ metrics cho tất cả các folds
+    fold_train_losses = []
+    fold_train_accuracies = []
+    fold_val_losses = []
+    fold_val_accuracies = []
+    fold_test_losses = []
+    fold_test_accuracies = []
 
-    # Thiết lập optimizer
-    optimizer = AdamW(model.parameters(), lr=2e-5)  # Tăng learning rate từ 1e-6 thành 2e-5
-    print(f"Learning rate: {2e-5}")
+    for fold, (train_ids, val_test_ids) in enumerate(kfold.split(X)):
+        print(f"\n--- Fold {fold + 1} ---")
 
-    # Khởi tạo Scheduler
-    total_steps = len(train_dataloader) * 5  # epochs=5
-    scheduler = get_linear_schedule_with_warmup(optimizer,
-                                                num_warmup_steps=0,
-                                                num_training_steps=total_steps)
+        # Chia tập val_test thành validation và test
+        val_ids, test_ids = train_test_split(val_test_ids, test_size=0.5, random_state=42)
 
-    # Khởi tạo SummaryWriter
-    writer = SummaryWriter(log_dir='runs/fine_tune_sikubert')
+        # Chia dữ liệu
+        train_df = data.iloc[train_ids].reset_index(drop=True)
+        val_df = data.iloc[val_ids].reset_index(drop=True)
+        test_df = data.iloc[test_ids].reset_index(drop=True)
 
-    epochs = 5
+        print(f"Training samples: {len(train_df)}, Validation samples: {len(val_df)}, Test samples: {len(test_df)}")
 
-    # Danh sách lưu trữ loss và accuracy
-    train_losses = []
-    train_accuracies = []
-    val_losses = []
-    val_accuracies = []
+        # Tạo các Dataset cho tập huấn luyện, validation và test
+        train_dataset = MaskedDataset(train_df, tokenizer, max_length=512)
+        val_dataset = MaskedDataset(val_df, tokenizer, max_length=512)
+        test_dataset = MaskedDataset(test_df, tokenizer, max_length=512)
 
-    # Huấn luyện
-    for epoch in range(epochs):
-        # Huấn luyện
-        model.train()
-        loop = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{epochs} - Training")
-        epoch_loss = 0
-        epoch_correct = 0
-        epoch_total = 0
+        # Tạo các DataLoader cho tập huấn luyện, validation và test
+        train_dataloader = DataLoader(train_dataset, batch_size=16, shuffle=True)
+        val_dataloader = DataLoader(val_dataset, batch_size=16, shuffle=False)
+        test_dataloader = DataLoader(test_dataset, batch_size=16, shuffle=False)
+        print(f"Created DataLoader with batch size 16 for Train, Validation, and Test.")
 
-        for batch_idx, batch in enumerate(loop):
-            optimizer.zero_grad()
+        # Đặt thiết bị
+        device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+        model.to(device)
+        print(f"Đang sử dụng thiết bị: {device}")
 
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
-            labels = batch['labels'].to(device)
+        # Thiết lập optimizer và scheduler cho từng fold
+        optimizer = AdamW(model.parameters(), lr=2e-5)
+        print(f"Fold {fold + 1} - Learning rate: {2e-5}")
 
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-            loss = outputs.loss
-            logits = outputs.logits  # [batch_size, seq_length, vocab_size]
+        epochs = 5
+        total_steps = len(train_dataloader) * epochs
+        scheduler = get_linear_schedule_with_warmup(optimizer,
+                                                    num_warmup_steps=0,
+                                                    num_training_steps=total_steps)
 
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            scheduler.step()
+        # Danh sách lưu trữ loss và accuracy cho fold hiện tại
+        fold_train_loss = []
+        fold_train_acc = []
+        fold_val_loss = []
+        fold_val_acc = []
+        fold_test_loss = []
+        fold_test_acc = []
 
-            epoch_loss += loss.item()
+        # Huấn luyện cho từng fold
+        for epoch in range(epochs):
+            print(f"\nFold {fold + 1} - Epoch {epoch + 1}/{epochs}")
 
-            # Tính accuracy
-            accuracy = compute_accuracy(logits, labels)
-            epoch_correct += accuracy.item() * input_ids.size(0)
-            epoch_total += input_ids.size(0)
+            # Huấn luyện
+            model.train()
+            loop = tqdm(train_dataloader, desc=f"Fold {fold +1} Epoch {epoch +1} - Training")
+            epoch_loss = 0
+            epoch_correct = 0
+            epoch_total = 0
 
-            train_losses.append(loss.item())
-            train_accuracies.append(accuracy.item())
+            for batch_idx, batch in enumerate(loop):
+                optimizer.zero_grad()
 
-            # Ghi lại loss và accuracy cho mỗi batch
-            global_step = epoch * len(train_dataloader) + batch_idx
-            writer.add_scalar('Loss/train', loss.item(), global_step)
-            writer.add_scalar('Accuracy/train', accuracy.item(), global_step)
+                input_ids = batch['input_ids'].to(device)
+                attention_mask = batch['attention_mask'].to(device)
+                labels = batch['labels'].to(device)
 
-            loop.set_postfix(loss=loss.item(), accuracy=f"{accuracy.item()*100:.2f}%")
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                loss = outputs.loss
+                logits = outputs.logits  # [batch_size, seq_length, vocab_size]
 
-        avg_epoch_loss = epoch_loss / len(train_dataloader)
-        avg_epoch_accuracy = epoch_correct / epoch_total
-        print(f"Epoch {epoch+1} Training Loss: {avg_epoch_loss:.4f} | Training Accuracy: {avg_epoch_accuracy*100:.2f}%")
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                scheduler.step()
 
-        # Đánh giá trên tập validation
+                epoch_loss += loss.item()
+
+                # Tính accuracy
+                accuracy = compute_accuracy(logits, labels)
+                epoch_correct += accuracy.item() * input_ids.size(0)
+                epoch_total += input_ids.size(0)
+
+                # Lưu trữ metrics
+                fold_train_loss.append(loss.item())
+                fold_train_acc.append(accuracy.item())
+
+                # Ghi lại loss và accuracy cho mỗi batch
+                global_step = fold * epochs * len(train_dataloader) + epoch * len(train_dataloader) + batch_idx
+                writer.add_scalar(f'Fold{fold +1}/Loss/train', loss.item(), global_step)
+                writer.add_scalar(f'Fold{fold +1}/Accuracy/train', accuracy.item(), global_step)
+
+                loop.set_postfix(loss=loss.item(), accuracy=f"{accuracy.item()*100:.2f}%")
+
+            avg_epoch_loss = epoch_loss / len(train_dataloader)
+            avg_epoch_accuracy = epoch_correct / epoch_total
+            print(f"Fold {fold +1} - Epoch {epoch +1} Training Loss: {avg_epoch_loss:.4f} | Training Accuracy: {avg_epoch_accuracy*100:.2f}%")
+
+            # Đánh giá trên tập validation
+            model.eval()
+            val_loss = 0
+            val_correct = 0
+            val_total = 0
+
+            with torch.no_grad():
+                loop = tqdm(val_dataloader, desc=f"Fold {fold +1} Epoch {epoch +1} - Validation")
+                for batch in loop:
+                    input_ids = batch['input_ids'].to(device)
+                    attention_mask = batch['attention_mask'].to(device)
+                    labels = batch['labels'].to(device)
+
+                    outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                    loss = outputs.loss
+                    logits = outputs.logits
+
+                    val_loss += loss.item()
+
+                    accuracy = compute_accuracy(logits, labels)
+                    val_correct += accuracy.item() * input_ids.size(0)
+                    val_total += input_ids.size(0)
+
+                    # Lưu trữ metrics
+                    fold_val_loss.append(loss.item())
+                    fold_val_acc.append(accuracy.item())
+
+                    # Ghi lại loss và accuracy cho mỗi batch
+                    global_step = fold * epochs * len(train_dataloader) + epoch * len(train_dataloader) + batch_idx
+                    writer.add_scalar(f'Fold{fold +1}/Loss/val', loss.item(), global_step)
+                    writer.add_scalar(f'Fold{fold +1}/Accuracy/val', accuracy.item(), global_step)
+
+                    loop.set_postfix(loss=loss.item(), accuracy=f"{accuracy.item()*100:.2f}%")
+
+            avg_val_loss = val_loss / len(val_dataloader)
+            avg_val_accuracy = val_correct / val_total
+            print(f"Fold {fold +1} - Epoch {epoch +1} Validation Loss: {avg_val_loss:.4f} | Validation Accuracy: {avg_val_accuracy*100:.2f}%")
+
+            # Ghi lại loss và accuracy trung bình cho mỗi epoch
+            writer.add_scalar(f'Fold{fold +1}/Loss/train_epoch', avg_epoch_loss, epoch)
+            writer.add_scalar(f'Fold{fold +1}/Accuracy/train_epoch', avg_epoch_accuracy, epoch)
+            writer.add_scalar(f'Fold{fold +1}/Loss/val_epoch', avg_val_loss, epoch)
+            writer.add_scalar(f'Fold{fold +1}/Accuracy/val_epoch', avg_val_accuracy, epoch)
+
+        # Đánh giá trên tập test sau khi huấn luyện xong tất cả các epochs cho fold này
+        print(f"\nFold {fold +1} - Evaluating on Test Set")
         model.eval()
-        val_loss = 0
-        val_correct = 0
-        val_total = 0
+        test_loss = 0
+        test_correct = 0
+        test_total = 0
 
         with torch.no_grad():
-            loop = tqdm(val_dataloader, desc=f"Epoch {epoch+1}/{epochs} - Validation")
+            loop = tqdm(test_dataloader, desc=f"Fold {fold +1} - Test Evaluation")
             for batch in loop:
                 input_ids = batch['input_ids'].to(device)
                 attention_mask = batch['attention_mask'].to(device)
@@ -232,80 +308,59 @@ def main():
                 loss = outputs.loss
                 logits = outputs.logits
 
-                val_loss += loss.item()
+                test_loss += loss.item()
 
                 accuracy = compute_accuracy(logits, labels)
-                val_correct += accuracy.item() * input_ids.size(0)
-                val_total += input_ids.size(0)
+                test_correct += accuracy.item() * input_ids.size(0)
+                test_total += input_ids.size(0)
 
-                val_losses.append(loss.item())
-                val_accuracies.append(accuracy.item())
+                # Lưu trữ metrics
+                fold_test_loss.append(loss.item())
+                fold_test_acc.append(accuracy.item())
+
+                # Ghi lại loss và accuracy cho mỗi batch
+                global_step = fold * epochs * len(train_dataloader) + epoch * len(train_dataloader) + batch_idx
+                writer.add_scalar(f'Fold{fold +1}/Loss/test', loss.item(), global_step)
+                writer.add_scalar(f'Fold{fold +1}/Accuracy/test', accuracy.item(), global_step)
 
                 loop.set_postfix(loss=loss.item(), accuracy=f"{accuracy.item()*100:.2f}%")
 
-        avg_val_loss = val_loss / len(val_dataloader)
-        avg_val_accuracy = val_correct / val_total
-        print(f"Epoch {epoch+1} Validation Loss: {avg_val_loss:.4f} | Validation Accuracy: {avg_val_accuracy*100:.2f}%")
+        avg_test_loss = test_loss / len(test_dataloader)
+        avg_test_accuracy = test_correct / test_total
+        print(f"Fold {fold +1} - Test Loss: {avg_test_loss:.4f} | Test Accuracy: {avg_test_accuracy*100:.2f}%")
 
-        # Ghi lại loss và accuracy trung bình cho mỗi epoch
-        writer.add_scalar('Loss/train_epoch', avg_epoch_loss, epoch)
-        writer.add_scalar('Accuracy/train_epoch', avg_epoch_accuracy, epoch)
-        writer.add_scalar('Loss/val_epoch', avg_val_loss, epoch)
-        writer.add_scalar('Accuracy/val_epoch', avg_val_accuracy, epoch)
+        # Lưu kết quả của fold này
+        fold_train_losses.append(np.mean(fold_train_loss))
+        fold_train_accuracies.append(np.mean(fold_train_acc))
+        fold_val_losses.append(np.mean(fold_val_loss))
+        fold_val_accuracies.append(np.mean(fold_val_acc))
+        fold_test_losses.append(avg_test_loss)
+        fold_test_accuracies.append(avg_test_accuracy)
+
+        # Lưu mô hình cho từng fold nếu muốn
+        save_model_path = f"extended_sikubert_model_fold{fold +1}"
+        tokenizer.save_pretrained(save_model_path)
+        model.save_pretrained(save_model_path)
+        print(f"Fold {fold +1} - Model và tokenizer đã được lưu tại {save_model_path}")
+
+    # Tính toán và in ra kết quả trung bình và độ lệch chuẩn của các folds
+    print("\n=== K-Fold Cross Validation Results ===")
+    for fold in range(k_folds):
+        print(f"Fold {fold +1} - Train Loss: {fold_train_losses[fold]:.4f}, Train Acc: {fold_train_accuracies[fold]*100:.2f}% | Val Loss: {fold_val_losses[fold]:.4f}, Val Acc: {fold_val_accuracies[fold]*100:.2f}% | Test Loss: {fold_test_losses[fold]:.4f}, Test Acc: {fold_test_accuracies[fold]*100:.2f}%")
+
+    print("\n=== Aggregated Results ===")
+    print(f"Average Train Loss: {np.mean(fold_train_losses):.4f} ± {np.std(fold_train_losses):.4f}")
+    print(f"Average Train Accuracy: {np.mean(fold_train_accuracies)*100:.2f}% ± {np.std(fold_train_accuracies)*100:.2f}%")
+    print(f"Average Validation Loss: {np.mean(fold_val_losses):.4f} ± {np.std(fold_val_losses):.4f}")
+    print(f"Average Validation Accuracy: {np.mean(fold_val_accuracies)*100:.2f}% ± {np.std(fold_val_accuracies)*100:.2f}%")
+    print(f"Average Test Loss: {np.mean(fold_test_losses):.4f} ± {np.std(fold_test_losses):.4f}")
+    print(f"Average Test Accuracy: {np.mean(fold_test_accuracies)*100:.2f}% ± {np.std(fold_test_accuracies)*100:.2f}%")
 
     # Đóng SummaryWriter
     writer.close()
 
-    # Lưu model và tokenizer
-    save_model_path = "extended_sikubert_model"
-    tokenizer.save_pretrained(save_model_path)
-    model.save_pretrained(save_model_path)
-    print(f"Model và tokenizer đã được lưu tại {save_model_path}")
-
-    # Dự đoán và đánh giá
-    test_sentences = [
-        "𨤧𡗶坦常欺[MASK]𡏧",
-        "客𦟐[MASK]𡗉餒迍邅",
-        "撑[MASK]𠽉瀋層𨕭"
-    ]
-
-    model.eval()
-    with torch.no_grad():
-        for i, sentence in enumerate(test_sentences):
-            encoding = tokenizer(
-                sentence,
-                return_tensors='pt',
-                truncation=True,
-                padding='max_length',
-                max_length=512
-            )
-            input_ids = encoding['input_ids'].to(device)
-            attention_mask = encoding['attention_mask'].to(device)
-
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            logits = outputs.logits  # [1, seq_length, vocab_size]
-
-            # Tìm vị trí của [MASK]
-            mask_token_index = torch.where(input_ids == tokenizer.mask_token_id)[1]
-
-            if len(mask_token_index) != 1:
-                raise ValueError(f"Câu: {sentence} không có đúng một [MASK] token.")
-
-            mask_index = mask_token_index.item()
-
-            # Lấy dự đoán tại vị trí [MASK]
-            predicted_token_id = logits[0, mask_index, :].argmax(dim=-1)
-            predicted_token = tokenizer.convert_ids_to_tokens(predicted_token_id)
-
-            # Lấy label thực tế từ dataset nếu có
-            actual_label = df.iloc[i]['Label'] if i < len(df) else None
-
-            print(f"Câu: {sentence}")
-            print(f"Predicted Label: {predicted_token}")
-            if actual_label:
-                print(f"Actual Label: {actual_label}")
-                print(f"Dự đoán đúng không? {'Có' if predicted_token == actual_label else 'Không'}")
-            print("-" * 50)
+if __name__ == "__main__":
+    main()
 
 if __name__ == "__main__":
     main()
