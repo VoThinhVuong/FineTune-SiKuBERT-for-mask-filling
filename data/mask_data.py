@@ -38,8 +38,8 @@ def replace_with_mask(chinese_string):
             idx = random.randint(0, n - 1)
             if idx not in indices_set:
                 indices_set.append(idx)
-        replaced_1 = insert_mask(chinese_string, [indices_set[0]]) + f", {chinese_string[indices_set[0]]}"
-        replaced_2 = insert_mask(chinese_string, [indices_set[1]]) + f", {chinese_string[indices_set[1]]}"
+        replaced_1 = insert_mask(chinese_string, [indices_set[0]]) + f",{chinese_string[indices_set[0]]}"
+        replaced_2 = insert_mask(chinese_string, [indices_set[1]]) + f",{chinese_string[indices_set[1]]}"
         return [replaced_1, replaced_2]
 
     elif 7 < n <= 12:
@@ -75,6 +75,8 @@ def create_masked_data_file(filename, data_folder = "not_masked_data", dest_fold
 
     with open(new_name, "w", encoding="utf-8") as file:
         for obj in masked_str:
+            if not obj:
+                continue
             for lines in obj:
                 file.writelines(lines + "\n")
 
@@ -86,12 +88,12 @@ def mask_all_data(data_folder, dest_folder):
 
 
 def main():
-    data_folder = "not_masked_data"
-    dest_folder = "masked_data"
+    data_folder = "data/not_masked_data"
+    dest_folder = "data/masked_data"
     mask_all_data(data_folder,dest_folder)
 
     file_names = os.listdir(dest_folder)
-    with open("data.txt", "w", encoding="utf-8") as file:
+    with open("data/data.txt", "w", encoding="utf-8") as file:
         res = ""
         for filename in file_names:
             with open(dest_folder + "/" + filename, "r", encoding="utf-8") as masked_file:
