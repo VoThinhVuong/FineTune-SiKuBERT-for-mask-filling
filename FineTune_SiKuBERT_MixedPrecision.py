@@ -6,9 +6,10 @@ from torch.utils.tensorboard import SummaryWriter
 import matplotlib.pyplot as plt
 import math
 import pandas as pd
+import numpy as np
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split, KFold
-import ast
+from torch.cuda.amp import autocast, GradScaler
 
 
 
@@ -188,6 +189,7 @@ def main():
         scheduler = get_linear_schedule_with_warmup(optimizer,
                                                     num_warmup_steps=0,
                                                     num_training_steps=total_steps)
+        scaler = GradScaler()
 
         # Danh sách lưu trữ loss và accuracy cho fold hiện tại
         fold_train_loss = []
@@ -208,6 +210,9 @@ def main():
             epoch_correct = 0
             epoch_total = 0
 
+
+
+            
             for batch_idx, batch in enumerate(loop):
                 optimizer.zero_grad()
 
@@ -215,13 +220,21 @@ def main():
                 attention_mask = batch['attention_mask'].to(device)
                 labels = batch['labels'].to(device)
 
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-                loss = outputs.loss
-                logits = outputs.logits  # [batch_size, seq_length, vocab_size]
+                with autocast():  # Bắt đầu autocast context
+                    outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                    loss = outputs.loss
+                    logits = outputs.logits  # [batch_size, seq_length, vocab_size]
 
-                loss.backward()
+                # Scale loss và thực hiện backward
+                scaler.scale(loss).backward()
+
+                # Clip gradients nếu cần thiết
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
+
+                # Thực hiện bước optimizer và scheduler
+                scaler.step(optimizer)
+                scaler.update()
                 scheduler.step()
 
                 epoch_loss += loss.item()
@@ -242,6 +255,12 @@ def main():
 
                 loop.set_postfix(loss=loss.item(), accuracy=f"{accuracy.item()*100:.2f}%")
 
+
+
+
+
+
+
             avg_epoch_loss = epoch_loss / len(train_dataloader)
             avg_epoch_accuracy = epoch_correct / epoch_total
             print(f"Fold {fold +1} - Epoch {epoch +1} Training Loss: {avg_epoch_loss:.4f} | Training Accuracy: {avg_epoch_accuracy*100:.2f}%")
@@ -254,14 +273,15 @@ def main():
 
             with torch.no_grad():
                 loop = tqdm(val_dataloader, desc=f"Fold {fold +1} Epoch {epoch +1} - Validation")
-                for batch in loop:
+                for batch_idx, batch in enumerate(loop):
                     input_ids = batch['input_ids'].to(device)
                     attention_mask = batch['attention_mask'].to(device)
                     labels = batch['labels'].to(device)
 
-                    outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-                    loss = outputs.loss
-                    logits = outputs.logits
+                    with autocast():  # Bắt đầu autocast context cho đánh giá
+                        outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                        loss = outputs.loss
+                        logits = outputs.logits
 
                     val_loss += loss.item()
 
@@ -278,7 +298,9 @@ def main():
                     writer.add_scalar(f'Fold{fold +1}/Loss/val', loss.item(), global_step)
                     writer.add_scalar(f'Fold{fold +1}/Accuracy/val', accuracy.item(), global_step)
 
-                    loop.set_postfix(loss=loss.item(), accuracy=f"{accuracy.item()*100:.2f}%")
+                    loop.set_postfix(loss=loss.item(), accuracy=f"{accuracy.item()*100:.4f}%")
+
+
 
             avg_val_loss = val_loss / len(val_dataloader)
             avg_val_accuracy = val_correct / val_total
@@ -297,16 +319,18 @@ def main():
         test_correct = 0
         test_total = 0
 
+        
         with torch.no_grad():
             loop = tqdm(test_dataloader, desc=f"Fold {fold +1} - Test Evaluation")
-            for batch in loop:
+            for batch_idx, batch in enumerate(loop):
                 input_ids = batch['input_ids'].to(device)
                 attention_mask = batch['attention_mask'].to(device)
                 labels = batch['labels'].to(device)
 
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-                loss = outputs.loss
-                logits = outputs.logits
+                with autocast():  # Bắt đầu autocast context cho đánh giá
+                    outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                    loss = outputs.loss
+                    logits = outputs.logits
 
                 test_loss += loss.item()
 
@@ -323,7 +347,9 @@ def main():
                 writer.add_scalar(f'Fold{fold +1}/Loss/test', loss.item(), global_step)
                 writer.add_scalar(f'Fold{fold +1}/Accuracy/test', accuracy.item(), global_step)
 
-                loop.set_postfix(loss=loss.item(), accuracy=f"{accuracy.item()*100:.2f}%")
+                loop.set_postfix(loss=loss.item(), accuracy=f"{accuracy.item()*100:.4f}%")
+
+
 
         avg_test_loss = test_loss / len(test_dataloader)
         avg_test_accuracy = test_correct / test_total
