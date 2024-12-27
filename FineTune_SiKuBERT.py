@@ -117,7 +117,10 @@ def main():
     print(f"Loaded dataset with {len(df)} samples.")
 
     # Chuyển đổi cột 'Label' từ chuỗi thành danh sách
-    df['Label'] = df['Label'].apply(lambda x: ast.literal_eval(x) if isinstance(x, str) else x)
+    #df['Label'] = df['Label'].apply(lambda x: ast.literal_eval(x) if isinstance(x, str) else x)
+    df['Label'] = df['Label'].apply(
+        lambda x: x.strip("[]").replace("'", "").split(", ") if isinstance(x, str) else x
+    )
 
     # Kiểm tra và thêm OOV tokens vào tokenizer
     oov_tokens = [token for token in df['Label'].explode().unique() if token not in tokenizer.get_vocab()]
@@ -358,6 +361,12 @@ def main():
 
     # Đóng SummaryWriter
     writer.close()
+
+
+    save_model_path = f"extended_sikubert_model"
+    tokenizer.save_pretrained(save_model_path)
+    model.save_pretrained(save_model_path)
+    print(f"Fold {fold +1} - Model và tokenizer đã được lưu tại {save_model_path}")
 
 if __name__ == "__main__":
     main()
