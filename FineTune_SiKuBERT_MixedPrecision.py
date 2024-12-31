@@ -388,7 +388,7 @@ def main():
     # Đóng SummaryWriter
     writer.close()
 
-    save_model_path = f"extended_sikubert_model_fold{fold +1}"
+    save_model_path = f"extended_sikubert_model"
     tokenizer.save_pretrained(save_model_path)
     model.save_pretrained(save_model_path)
     print(f"Fold {fold +1} - Model và tokenizer đã được lưu tại {save_model_path}")
